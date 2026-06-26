@@ -1,0 +1,388 @@
+---
+title: "protein_elastic"
+author: "WJOY"
+date: "2025-07-31"
+output: pdf_document
+---
+
+```{r}
+library(car)
+library(glmnet)
+library(caret)
+library(glmnetUtils)
+library(dplyr)
+library(missRanger)
+```
+
+```{r}
+ml_test_data <- read.csv("ml_data.csv")
+exclude_cols <- c("f.eid", "f.21001.0.0")
+cols_to_transform <- setdiff(colnames(ml_test_data), exclude_cols)
+
+set.seed(123)
+n <- nrow(ml_test_data)
+train_index <- sample(1:n, size = floor(0.7 * n))
+test_index <- setdiff(1:n, c(train_index))
+
+train <- ml_test_data[train_index, c(cols_to_transform, exclude_cols), drop = FALSE]
+test <- ml_test_data[test_index, c(cols_to_transform, exclude_cols), drop = FALSE]
+```
+
+```{r}
+pt_cols <- grep("_pt$", colnames(train), value = TRUE)
+pt_missing_rate <- sapply(train[, pt_cols], function(x) mean(is.na(x)))
+summary(pt_missing_rate)
+hist(pt_missing_rate, breaks = 50, col = "skyblue",
+     main = "Distribution of Missing Rate for _pt Columns",
+     xlab = "Missing Rate", ylab = "Number of Columns")
+```
+```{r}
+library(e1071)
+
+analyze_protein_skewness <- function(df, protein_cols, skew_threshold = 1, right_skew_threshold = 1) {
+  skew_values <- sapply(df[, protein_cols], skewness, na.rm = TRUE)
+  result_df <- data.frame(
+    Protein = names(skew_values),
+    Skewness = skew_values,
+    Recommend_Log = skew_values > skew_threshold
+  )
+  hist(skew_values, breaks = 50, col = "skyblue",
+       main = "Skewness Distribution of Protein Intensities",
+       xlab = "Skewness", ylab = "Number of Proteins")
+  abline(v = skew_threshold, col = "red", lwd = 2, lty = 2)
+  cat(sprintf("totall protein:%d\n", length(skew_values)))
+  cat(sprintf("Skewness > %.1f proteins:%d\n", skew_threshold, sum(result_df$Recommend_Log)))
+  cat(sprintf("Skewness > %.1f proportion:%.2f%%\n",
+              right_skew_threshold,
+              mean(skew_values > right_skew_threshold) * 100))
+
+  return(result_df)
+}
+
+protein_cols <- grep("_p$", colnames(train), value = TRUE)
+skew_report <- analyze_protein_skewness(train, protein_cols)
+```
+
+
+```{r}
+protein_cols <- grep("_p$", colnames(train), value = TRUE)
+
+get_protein_stats <- function(df, protein_cols) {
+  stats <- data.frame(
+    Protein = protein_cols,
+    Mean = sapply(df[, protein_cols], mean, na.rm = TRUE),
+    SD = sapply(df[, protein_cols], sd, na.rm = TRUE),
+    Min = sapply(df[, protein_cols], min, na.rm = TRUE),
+    Max = sapply(df[, protein_cols], max, na.rm = TRUE),
+    NA_Count = sapply(df[, protein_cols], function(x) sum(is.na(x)))
+  )
+  return(stats)
+}
+
+train_stats <- get_protein_stats(train, protein_cols)
+test_stats <- get_protein_stats(test, protein_cols)
+
+```
+
+```{r}
+summary(train_stats$Mean)
+summary(train_stats$SD)
+summary(train_stats$NA_Count)
+summary(test_stats$Mean)
+summary(test_stats$SD)
+summary(test_stats$NA_Count)
+```
+
+```{r}
+na_rate_before_train <- sapply(train[, pt_cols], function(x) mean(is.na(x)))
+cat(sprintf("lack raio:%.2f%%\n", mean(na_rate_before_train) * 100))
+cat(sprintf("colme:%d\n", sum(na_rate_before_train > 0)))
+```
+
+
+```{r}
+pt_medians <- sapply(train[, pt_cols], function(x) median(x, na.rm = TRUE))
+
+fill_pt_missing <- function(df, pt_medians) {
+  for (col in names(pt_medians)) {
+    if (col %in% colnames(df)) {
+      df[[col]][is.na(df[[col]])] <- pt_medians[[col]]
+    }
+  }
+  return(df)
+}
+
+train <- fill_pt_missing(train, pt_medians)
+test <- fill_pt_missing(test, pt_medians)
+```
+
+```{r}
+na_rate_after_train <- sapply(train[, pt_cols], function(x) mean(is.na(x)))
+cat(sprintf("lack raio:%.2f%%\n", mean(na_rate_after_train) * 100))
+cat(sprintf("colme:%d\n", sum(na_rate_after_train > 0)))
+```
+
+```{r}
+model_list <- list()
+
+for (i in seq_along(protein_cols)) {
+  prot <- protein_cols[i]
+  pt <- pt_cols[i]
+  adj_name <- paste0(prot, "_adj")
+
+  dat_train <- data.frame(y = train[[prot]], x = train[[pt]])
+  model <- lm(y ~ x, data = dat_train)
+  model_list[[prot]] <- model
+
+  train[[adj_name]] <- residuals(model)
+
+  dat_test <- data.frame(y = test[[prot]], x = test[[pt]])
+  pred_test <- tryCatch({
+    predict(model, newdata = dat_test)
+  }, error = function(e) rep(NA, nrow(test)))
+
+  test[[adj_name]] <- test[[prot]] - pred_test
+}
+
+saveRDS(model_list, file = "protein_lm_models.rds")
+```
+
+
+```{r}
+adj_cols <- grep("_adj$", colnames(train), value = TRUE)
+scaled_train <- scale(train[, adj_cols])
+
+scaling_attrs <- list(
+  center = attr(scaled_train, "scaled:center"),
+  scale = attr(scaled_train, "scaled:scale")
+)
+
+train[, adj_cols] <- as.data.frame(scaled_train)
+
+test[, adj_cols] <- scale(
+  test[, adj_cols],
+  center = scaling_attrs$center,
+  scale = scaling_attrs$scale
+)
+saveRDS(pt_medians, "pt_train_median.rds")
+saveRDS(scaling_attrs, "pro_adj_scaling.rds")
+```
+
+```{r}
+train_stats_after <- get_protein_stats(train, adj_cols)
+test_stats_after <- get_protein_stats(test, adj_cols)
+summary(train_stats_after$Mean)
+summary(train_stats_after$SD)
+summary(test_stats_after$Mean)
+summary(test_stats_after$SD)
+```
+
+```{r}
+key_cols <- c("f.eid", "f.21001.0.0")
+final_cols <- c(key_cols, adj_cols)
+
+train <- train[, final_cols]
+test  <- test[, final_cols]
+
+X_train <- as.matrix(train[, !(colnames(train) %in% c("f.eid", "f.21001.0.0"))])
+y_train <- train$f.21001.0.0
+
+X_test <- as.matrix(test[, !(colnames(test) %in% c("f.eid", "f.21001.0.0"))])
+y_test <- test$f.21001.0.0
+```
+
+```{r}
+# baseline
+baseline_mse <- mean((y_test - mean(y_train))^2)
+total_variance <- mean((y_test - mean(y_test))^2)
+
+baseline_r2 <- 1 - (baseline_mse / total_variance)
+baseline_mse
+print(baseline_r2)
+```
+
+```{r}
+# lambda test
+ridge_cv <- cv.glmnet(X_train, y_train, alpha = 0)
+lasso_cv <- cv.glmnet(X_train, y_train, alpha = 1)
+elastic_cv <- cv.glmnet(X_train, y_train, alpha = 0.5)
+
+best_lambda_ridge <- ridge_cv$lambda.min
+best_lambda_lasso <- lasso_cv$lambda.min
+best_lambda_elastic <- elastic_cv$lambda.min
+
+cat("Ridge best λ:", best_lambda_ridge, "\n")
+cat("LASSO best λ:", best_lambda_lasso, "\n")
+cat("Elastic best λ:", best_lambda_elastic, "\n")
+```
+
+```{r}
+# ridge model
+ridge_model <- glmnet(X_train, y_train, family = "gaussian", alpha = 0)
+print(ridge_model)
+ridge_model_df <- as.matrix(ridge_model)
+write.csv(ridge_model_df, file = "ridge_model_pro.csv")
+plot(ridge_model, label = TRUE)
+plot(ridge_model, xvar = "lambda", label = TRUE)
+ridge_coef <- predict(ridge_model, s = best_lambda_ridge, type = "coefficients")
+print(ridge_coef)
+ridge_coef_df <- as.matrix(ridge_coef)
+write.csv(ridge_coef_df, file = "ridge_coef_pro.csv")
+plot(ridge_model, xvar = "dev", label = TRUE)
+
+ridge_predictions <- predict(ridge_model, newx = X_test, s = best_lambda_ridge, type = "response")
+plot(ridge_predictions, y_test, 
+     xlab = "Predicted BMI", ylab = "Actual BMI", 
+     main = "Ridge Regression: Predicted vs Actual", col = "blue", pch = 19)
+abline(0, 1, col = "red")
+ridge_resid <- ridge_predictions - y_test
+ridge_mse <- mean(ridge_resid^2)
+cat("Ridge Regression (MSE):", ridge_mse)
+ridge_mae <- mean(abs(ridge_resid))
+cat("Ridge Regression (MAE):", ridge_mae)
+ridge_ss_total <- sum((y_test - mean(y_test))^2)
+ridge_ss_res <-sum(ridge_resid^2)
+ridge_r_squared <- 1 - (ridge_ss_res / ridge_ss_total)
+cat("Ridge Regression (r_squared):", ridge_r_squared)
+ridge_n <- 1000
+ridge_p <- ncol(X_test)
+ridge_adjusted_r_squared <- 1 - (1 - ridge_r_squared) * ((ridge_n -1 ) / (ridge_n - ridge_p - 1))
+cat("Ridge Regression (adjusted_r_squared):", ridge_adjusted_r_squared)
+```
+
+```{r}
+#lasso model
+lasso_model <- glmnet(X_train, y_train, family = "gaussian", alpha = 1)
+print(lasso_model)
+lasso_model_df <- as.matrix(lasso_model)
+write.csv(lasso_model_df, file = "lasso_model_pro.csv")
+plot(lasso_model, xvar = "lambda", label = TRUE)
+lasso_coef <- predict(lasso_model, s = best_lambda_lasso, type = "coefficients")
+lasso_coef
+lasso_coef_df <- as.matrix(lasso_coef)
+write.csv(lasso_coef_df, file = "lasso_coef_pro.csv")
+lasso_predictions <- predict(lasso_model, newx = X_test, s = best_lambda_lasso, type = "response")
+plot(lasso_predictions, y_test, 
+     xlab = "Predicted BMI", ylab = "Actual BMI", 
+     main = "Lasso Regression: Predicted vs Actual", col = "blue", pch = 19)
+abline(0, 1, col = "red")
+lasso_resid <- lasso_predictions - y_test
+lasso_mse <- mean(lasso_resid^2)
+cat("Lasso Regression (MSE):", lasso_mse)
+lasso_mae <- mean(abs(lasso_resid))
+cat("Lasso Regression (MAE):", lasso_mae)
+lasso_ss_total <- sum((y_test - mean(y_test))^2)
+lasso_ss_res <-sum(lasso_resid^2)
+lasso_r_squared <- 1 - (lasso_ss_res / lasso_ss_total)
+cat("Lasso Regression (r_squared):", lasso_r_squared)
+lasso_n <- 1000
+lasso_p <- ncol(X_test)
+lasso_adjusted_r_squared <- 1 - (1 - lasso_r_squared) * ((lasso_n -1 ) / (lasso_n - lasso_p - 1))
+cat("Lasso Regression (adjusted_r_squared):", lasso_adjusted_r_squared)
+```
+```{r}
+n_selected <- sum(lasso_coef[-1] != 0)
+cat("Number of selected proteins:", n_selected, "\n")
+```
+
+
+```{r}
+# elastic net
+set.seed(123)
+log_lambda_range <- seq(-4, 0.2, by = 0.1)  
+lambda_range <- 10^log_lambda_range        
+alpha_values <- seq(0.1, 0.9, by = 0.1) 
+grid <- expand.grid(.alpha = alpha_values, .lambda = lambda_range)
+control <- trainControl(method = "cv",number = 10) 
+train <- train %>% select(-f.eid)
+enet_train <- train(
+  f.21001.0.0 ~ ., 
+  data = train, 
+  method = "glmnet", 
+  trControl = control, 
+  tuneGrid = grid
+)
+print(enet_train$bestTune)
+print(enet_train$results)
+```
+```{r}
+write.csv(enet_train$results, file = "enet_train_results_pro.csv", row.names = FALSE)
+```
+
+
+```{r}
+enet_train$resample
+plot(enet_train)
+summary(enet_train)
+```
+
+```{r}
+best_alpha <- 0.9
+best_lambda <- 0.0448107171
+final_model <- glmnet(
+  x = X_train, 
+  y = y_train, 
+  alpha = best_alpha, 
+  lambda = best_lambda, 
+  family = "gaussian"
+)
+
+predicted <- predict(final_model, newx = X_test, s = best_lambda)
+coef(final_model)
+mse <- mean((predicted - y_test)^2)
+mae <- mean(abs(predicted - y_test))
+rsquared <- 1 - sum((predicted - y_test)^2) / sum((y_test - mean(y_test))^2)
+rsq <- cor(predicted,y_test)^2
+cat("MSE: ", mse, "\n")
+cat("MAE: ", mae, "\n")
+cat("R-squared: ", rsquared, "\n")
+cat("R-squared: ", rsq, "\n")
+plot(final_model, xvar = "lambda", label = TRUE)
+```
+```{r}
+elastic_coef <- coef(final_model)
+elastic_coef_df <- as.matrix(elastic_coef)
+write.csv(elastic_coef_df, file = "elastic_coef_pro.csv")
+```
+
+```{r}
+set.seed(123)
+n_boot <- 100
+nonzero_matrix <- matrix(0, nrow = ncol(X_train), ncol = n_boot)
+mse_list <- numeric(n_boot)
+
+for (i in 1:n_boot) {
+  idx <- sample(1:nrow(X_train), replace = TRUE)
+  x_boot <- X_train[idx, ]
+  y_boot <- y_train[idx]
+
+  model_boot <- glmnet(x_boot, y_boot, alpha = best_alpha, lambda = best_lambda)
+  
+  coef_i <- as.vector(coef(model_boot))[-1]
+  nonzero_matrix[, i] <- as.numeric(coef_i != 0)
+
+  pred <- predict(model_boot, newx = X_test, s = best_lambda)
+  mse_list[i] <- mean((pred - y_test)^2)
+}
+
+var_names <- colnames(X_train)
+select_freq <- rowSums(nonzero_matrix) / n_boot
+names(select_freq) <- var_names
+
+cat("Top 10 most stable variables:\n")
+print(sort(select_freq, decreasing = TRUE)[1:10])
+
+cat("\n MSE summary:\n")
+print(summary(mse_list))
+
+```
+
+```{r}
+stable_vars <- sort(select_freq[select_freq > 0.6], decreasing = TRUE)
+print(stable_vars)
+length(stable_vars) / length(select_freq)
+```
+
+```{r}
+saveRDS(final_model, file = "elastic_net_model_pro.rds") 
+```
